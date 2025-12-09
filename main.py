@@ -1,188 +1,189 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List, Optional
 import math
-import requests
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional, Union, Dict, Literal
 
-app = FastAPI()
+app = FastAPI(title="Yield Prediction API (Hardcoded Polygons + Pest Risk)")
 
-
-# =========================================================
-#   FETCH GROUND ELEVATION (SAME AS YOUR ORIGINAL FUNCTION)
-# =========================================================
-
-def get_ground_elevation(lat, lon):
-    try:
-        url = f"https://api.open-elevation.com/api/v1/lookup?locations={lat},{lon}"
-        r = requests.get(url, timeout=5).json()
-        return r["results"][0]["elevation"]
-    except:
-        return 0.0
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # =========================================================
-#                  GEOMETRY HELPERS
+# HARD-CODED DAMAGE POLYGONS (IGNORES USER INPUT)
 # =========================================================
 
-def polygon_area_from_latlon(points):
+HARD_CODED_POLYGONS = [
+    [
+        [28.4588642, 77.2972488],
+        [28.4588742, 77.2972688],
+        [28.4588542, 77.2972788],
+        [28.4588442, 77.2972588]
+    ],
+    [
+        [28.4588642, 77.2972488],
+        [28.4588842, 77.2972488],
+        [28.4588842, 77.2972788],
+        [28.4588642, 77.2972788]
+    ]
+]
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def polygon_area_from_latlon(points: List[List[float]]) -> float:
     if len(points) < 3:
         return 0.0
 
-    lats = [p[0] for p in points]
-    lons = [p[1] for p in points]
-    lat_ref = sum(lats) / len(lats)
-    lon_ref = lons[0]
+    lat_ref = sum(p[0] for p in points) / len(points)
+    lon_ref = points[0][1]
 
-    lat_to_m = 111320.0
-    lon_to_m = 111320.0 * math.cos(math.radians(lat_ref))
+    lat_to_m = 111320
+    lon_to_m = 111320 * math.cos(math.radians(lat_ref))
 
     xy = []
     for lat, lon in points:
-        x = (lon - lon_ref) * lon_to_m
-        y = (lat - lat_ref) * lat_to_m
-        xy.append((x, y))
+        xy.append([
+            (lon - lon_ref) * lon_to_m,
+            (lat - lat_ref) * lat_to_m
+        ])
 
     area = 0
-    n = len(xy)
-    for i in range(n):
+    for i in range(len(xy)):
         x1, y1 = xy[i]
-        x2, y2 = xy[(i + 1) % n]
+        x2, y2 = xy[(i + 1) % len(xy)]
         area += x1 * y2 - x2 * y1
 
-    return abs(area) * 0.5
-
-
-def meters_to_latlon_offsets(east_m, north_m, lat_ref):
-    lat_to_m = 111320.0
-    lon_to_m = 111320.0 * math.cos(math.radians(lat_ref))
-    return north_m / lat_to_m, east_m / lon_to_m
-
+    return abs(area * 0.5)
 
 # =========================================================
-#            DRONE FOOTPRINT CALCULATION
+# MODELS
 # =========================================================
 
-def camera_footprint_from_drone(
-    drone_lat, drone_lon,
-    drone_alt_msl,
-    compass_heading_deg,
-    mount_tilt_deg,
-    vertical_fov_deg,
-    horizontal_fov_deg
-):
-    ground_elev = get_ground_elevation(drone_lat, drone_lon)
-    h = drone_alt_msl - ground_elev
-    if h <= 0:
-        h = 5
+class SoilSensorValues(BaseModel):
+    Moisture_percent: Optional[float] = None
+    Temperature_C: Optional[float] = None
+    EC_uS_cm: Optional[float] = None
+    pH: Optional[float] = None
+    N_mg_per_kg: Optional[float] = None
+    P_mg_per_kg: Optional[float] = None
+    K_mg_per_kg: Optional[float] = None
 
-    half_v = vertical_fov_deg / 2
-    near_angle = max(0.0001, mount_tilt_deg - half_v)
-    far_angle = mount_tilt_deg + half_v
-
-    near_d = h * math.tan(math.radians(near_angle))
-    far_d = h * math.tan(math.radians(far_angle))
-
-    half_w_near = near_d * math.tan(math.radians(horizontal_fov_deg / 2))
-    half_w_far = far_d * math.tan(math.radians(horizontal_fov_deg / 2))
-
-    theta = math.radians(compass_heading_deg)
-
-    def en_from_forward_right(d_forward, right_offset):
-        ef = math.sin(theta)
-        nf = math.cos(theta)
-        er = math.cos(theta)
-        nr = -math.sin(theta)
-        east = d_forward * ef + right_offset * er
-        north = d_forward * nf + right_offset * nr
-        return east, north
-
-    corners_en = [
-        en_from_forward_right(near_d, -half_w_near),
-        en_from_forward_right(near_d, +half_w_near),
-        en_from_forward_right(far_d, +half_w_far),
-        en_from_forward_right(far_d, -half_w_far),
-    ]
-
-    footprint = []
-    for east_m, north_m in corners_en:
-        dlat, dlon = meters_to_latlon_offsets(east_m, north_m, drone_lat)
-        footprint.append((drone_lat + dlat, drone_lon + dlon))
-
-    return footprint
-
-
-# =========================================================
-#                REQUEST BODY MODELS
-# =========================================================
-
-class ManualPolygon(BaseModel):
-    type: str = "manual"
-    points: List[List[float]]  # [[lat, lon], [lat, lon] ...]
-
-
-class DronePolygon(BaseModel):
-    type: str = "drone"
-    drone_lat: float
-    drone_lon: float
-    drone_alt_msl: float
-    compass_heading_deg: float
-    mount_tilt_deg: float
-    vertical_fov_deg: float
-    horizontal_fov_deg: float
-
-
-class DamageRequest(BaseModel):
+class AnalyzeDamageRequest(BaseModel):
     farm_area_m2: float
     row_spacing: float
     plant_spacing: float
-    damage_polygons: List[ManualPolygon | DronePolygon]
 
+    # Ignored by backend
+    damage_polygons: Optional[list] = None
+
+    pest_image_url: Optional[str] = None
+    paddy_type: Optional[str] = "local"
+    growth_stage: Optional[str] = "reproductive"
+    soil_sensor_values: Optional[SoilSensorValues] = None
 
 # =========================================================
-#                     FASTAPI ENDPOINT
+# YIELD LOGIC
+# =========================================================
+
+def compute_soil_fertility(soil: Optional[Dict]) -> float:
+    if not soil:
+        return 0.5
+
+    score = 1.0
+    if soil.get("pH") and 5.5 <= soil["pH"] <= 7.5:
+        score += 0.1
+    else:
+        score -= 0.1
+
+    if soil.get("N_mg_per_kg", 0) < 20:
+        score -= 0.1
+
+    m = soil.get("Moisture_percent")
+    if m is not None:
+        if m < 20:
+            score -= 0.1
+        elif 30 <= m <= 60:
+            score += 0.05
+
+    return max(0.3, min(score, 1.2))
+
+
+def predict_yield(
+    surviving_plants: float,
+    paddy_type: str,
+    soil: Optional[Dict],
+    growth_stage: str
+):
+    base = 0.014
+
+    fert_factor = compute_soil_fertility(soil)
+
+    # 🔥 HARD-CODED pest risk score
+    PEST_RISK_SCORE = 0.37
+    pest_factor = max(0.5, 1 - (PEST_RISK_SCORE * 0.4))
+
+    variety_factor = 1.1 if "hybrid" in paddy_type.lower() else 1.0
+    stage_factor = 0.95 if "repro" in growth_stage.lower() else 1.0
+
+    per_plant = base * fert_factor * pest_factor * variety_factor * stage_factor
+    total_yield = per_plant * surviving_plants
+
+    return {
+        "per_plant_kg": per_plant,
+        "predicted_yield_kg": total_yield,
+        "lower_bound_kg": total_yield * 0.9,
+        "upper_bound_kg": total_yield * 1.1,
+        "hardcoded_pest_risk_score_used": PEST_RISK_SCORE
+    }
+
+# =========================================================
+# FINAL ENDPOINT
 # =========================================================
 
 @app.post("/analyze-damage")
-def analyze_damage(data: DamageRequest):
+def analyze_damage(data: AnalyzeDamageRequest):
 
     plant_density = 1 / (data.row_spacing * data.plant_spacing)
     total_plants = plant_density * data.farm_area_m2
 
+    lost_plants = 0
     total_damage_area = 0
-    total_lost_plants = 0
 
-    for d in data.damage_polygons:
-
-        if d.type == "manual":
-            poly = d.points
-
-        else:
-            poly = camera_footprint_from_drone(
-                d.drone_lat, d.drone_lon,
-                d.drone_alt_msl,
-                d.compass_heading_deg,
-                d.mount_tilt_deg,
-                d.vertical_fov_deg,
-                d.horizontal_fov_deg
-            )
-
+    # 🔥 IGNORE USER POLYGONS  
+    # ALWAYS use hardcoded polygons
+    for poly in HARD_CODED_POLYGONS:
         area = polygon_area_from_latlon(poly)
-        lost = area * plant_density
-
         total_damage_area += area
-        total_lost_plants += lost
+        lost_plants += area * plant_density
 
-    surviving = total_plants - total_lost_plants
-    yield_percentage = (surviving / total_plants) * 100
-    damage_percentage = 100 - yield_percentage
+    surviving = max(0, total_plants - lost_plants)
+
+    soil_vals = data.soil_sensor_values.dict() if data.soil_sensor_values else None
+
+    yield_result = predict_yield(
+        surviving_plants=surviving,
+        paddy_type=data.paddy_type,
+        soil=soil_vals,
+        growth_stage=data.growth_stage
+    )
 
     return {
         "farm_area_m2": data.farm_area_m2,
         "total_plants": total_plants,
-        "total_damage_area": total_damage_area,
-        "total_lost_plants": total_lost_plants,
+
+        "hardcoded_polygons_used": HARD_CODED_POLYGONS,
+
+        "damage_area_m2": total_damage_area,
+        "lost_plants": lost_plants,
         "remaining_plants": surviving,
-        "yield_remaining_percent": yield_percentage,
-        "yield_lost_percent": damage_percentage,
-        "total_rice_kg": surviving * 0.014
+
+        "yield_prediction": yield_result,
+
+        "pest_image_received": data.pest_image_url
     }
